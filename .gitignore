@@ -1,0 +1,4 @@
+*.json
+picorv32.v
+__pycache__/
+.DS_Store
