@@ -22,7 +22,7 @@ yosys -q -p "read_verilog picorv32.v; hierarchy -top picorv32_axi; proc; flatten
 $ python3 depgraph.py picorv32.json stats
 top module: picorv32_axi
 named signals: 240
-cells: 919 (116 registers, 803 combinational)
+cells: 919 (117 registers, 802 combinational)
 chip outputs: 19
 ```
 
@@ -48,7 +48,7 @@ And the whole downstream cone:
 ```
 $ python3 depgraph.py picorv32.json impact reg_pc
 picorv32_core.reg_pc (32 bits, declared at picorv32.v:176)
-  same clock cycle: 25 cells, landing in 5 registers
+  same clock cycle: 25 cells, landing in 6 registers
   across clock cycles: 893 of 919 cells
   chip outputs it can affect: 15 of 19 (trap, mem_axi_awvalid, mem_axi_awaddr, ...)
 ```
@@ -56,7 +56,77 @@ picorv32_core.reg_pc (32 bits, declared at picorv32.v:176)
 Two numbers because there are two questions. Stop at the registers and you get what moves in this same
 clock tick. Walk through them and you get what can move eventually, over many ticks.
 
-It also goes backwards (`drivers`) and compares two versions of a design (`diff`).
+It also goes backwards (`drivers`) and compares two versions of a design (`diff`). And it draws:
+
+```
+python3 depgraph.py picorv32.json dot mem_wstrb | dot -Tpng -o mem_wstrb.png
+```
+
+![the cells around mem_wstrb](mem_wstrb.png)
+
+One register at `picorv32.v:565` drives `mem_wstrb`, which fans out to seven cells. Blue is a register,
+white is combinational logic, and every box carries the line it came from.
+
+## Does it actually work?
+
+A graph that says "this signal can affect that one" is a claim, and I wanted it checked by something
+that is not me. PicoRV32 ships five deliberately broken versions of itself behind `ifdef`s, put there so
+you can test whether a testbench catches them. Two of them corrupt the register file:
+
+```verilog
+`ifdef PICORV32_TESTBUG_001
+        cpuregs[latched_rd ^ 1] <= cpuregs_wrdata;   // writes to the wrong register
+`elsif PICORV32_TESTBUG_002
+        cpuregs[latched_rd] <= cpuregs_wrdata ^ 1;   // writes the wrong value
+```
+
+So: simulate the design twice, once clean and once with the bug, dump both waveforms, and compare. Any
+signal whose trace differs really was affected by those lines. Then check that against what the graph
+predicted. If a signal really changed and the graph did not predict it, the graph is wrong.
+
+```
+$ python3 depgraph.py core.json verify clean.vcd bug1.vcd --line 1339,1340
+graph predicts 0 signals can be affected
+waveforms: 275 signals dumped, 118 changed, 76 of those are design signals the graph knows
+changed but not predicted: 76
+
+UNSOUND: the graph missed 76 signals the design drives.
+```
+
+The first run failed completely, and finding out why was the most useful thing in this project.
+Everything in a netlist is joined by wires except memories. Yosys turns the register file into a write
+cell and two read cells that find each other through a `MEMID` parameter, with no wire between them, so
+the walk hit the register file and stopped dead. I gave each memory one invented wire that the write
+drives and the reads depend on, which is nine lines in `load()`. Same test again:
+
+```
+$ python3 depgraph.py core.json verify clean.vcd bug1.vcd --line 1339,1340
+graph predicts 136 signals can be affected
+waveforms: 275 signals dumped, 118 changed, 76 of those are design signals the graph knows
+changed but not predicted: 4
+  dbg_mem_rdata  (an input, driven by the testbench, not by the design)
+  dbg_mem_ready  (an input, driven by the testbench, not by the design)
+  mem_rdata  (an input, driven by the testbench, not by the design)
+  mem_ready  (an input, driven by the testbench, not by the design)
+
+SOUND: every signal the design itself drives was predicted.
+```
+
+Both injected bugs now pass. The four signals it does not predict are the right four: `mem_rdata` and
+`mem_ready` are inputs to the core, and `dbg_mem_rdata` and `dbg_mem_ready` are aliases of them
+(`wire dbg_mem_ready = mem_ready;`). The bug changed which addresses the CPU asked for, so the testbench
+answered differently. That loop closes outside the core, and no graph of the core alone can see it.
+
+Reproduce it:
+
+```
+iverilog -o clean.vvp testbench_ez.v picorv32.v && vvp -N clean.vvp +vcd && mv testbench.vcd clean.vcd
+iverilog -DPICORV32_TESTBUG_001 -o bug1.vvp testbench_ez.v picorv32.v && vvp -N bug1.vvp +vcd && mv testbench.vcd bug1.vcd
+yosys -q -p "read_verilog picorv32.v; hierarchy -top picorv32; proc; flatten; opt_clean; write_json core.json"
+python3 depgraph.py core.json verify clean.vcd bug1.vcd --line 1339,1340
+```
+
+Top is `picorv32` here, not `picorv32_axi`, because that is what the testbench instantiates.
 
 ## Why it matters
 
@@ -100,7 +170,7 @@ yosys -q -p "read_verilog picorv32/picorv32.v; hierarchy -top picorv32_axi; proc
 python3 depgraph.py picorv32.json stats
 ```
 
-Python 3, nothing to install. Tested with Yosys 0.69 on macOS.
+Python 3, nothing to install. Yosys 0.69 and Icarus Verilog 13.0 on macOS. Graphviz for pictures.
 
 Limits worth knowing: Verilog only, one configuration at a time (`ENABLE_IRQ` defaults to 0, so the
 interrupt logic is not in the graph at all), cells are Yosys operators after `proc` rather than gates,

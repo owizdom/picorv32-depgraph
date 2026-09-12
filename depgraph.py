@@ -20,13 +20,28 @@ Then:
     python3 depgraph.py picorv32.json impact  reg_pc         # everything downstream of it
     python3 depgraph.py picorv32.json impact  reg_pc --tapeout
     python3 depgraph.py before.json diff after.json          # signals added and removed
+    python3 depgraph.py picorv32.json dot    cpu_state        # graphviz picture of one signal
+    python3 depgraph.py core.json     verify clean.vcd bug.vcd --line 1339
+                                                             # check the prediction against a real simulation
 """
 import json
+import re
 import sys
 
 # Cell types that hold a value until the next clock edge, ie. flip-flops and latches.
 # Everything else is combinational: it settles to a new answer as soon as its inputs move.
-REGISTER_TYPES = {"$dff", "$adff", "$dffe", "$adffe", "$sdff", "$sdffe", "$dffsr", "$dlatch", "$adlatch"}
+REGISTER_TYPES = {"$dff", "$adff", "$dffe", "$adffe", "$sdff", "$sdffe", "$dffsr", "$dlatch", "$adlatch",
+                  "$memwr", "$memwr_v2"}   # a write into a memory is state too
+
+
+def src_lines(obj):
+    """Every source line a cell or wire came from. Yosys can list several ranges joined by '|'."""
+    out = set()
+    for part in obj.get("attributes", {}).get("src", "").split("|"):
+        m = re.search(r":(\d+)\.\d+-(\d+)\.\d+$", part)
+        if m:
+            out.update(range(int(m.group(1)), int(m.group(2)) + 1))
+    return out
 
 
 def where(obj):
@@ -48,7 +63,7 @@ def load(path):
         if net.get("hide_name"):        # Yosys temporaries like $procmux$4218, no use to a human
             continue
         bits = [b for b in net["bits"] if isinstance(b, int)]
-        signals[name] = {"bits": bits, "where": where(net)}
+        signals[name] = {"bits": bits, "where": where(net), "lines": src_lines(net)}
         for b in bits:
             names_of.setdefault(b, []).append(name)
 
@@ -59,8 +74,23 @@ def load(path):
                  for port, bits in c["connections"].items()}
         ins = {b for d, bs in conns.values() if d != "output" for b in bs if isinstance(b, int)}
         outs = {b for d, bs in conns.values() if d == "output" for b in bs if isinstance(b, int)}
-        cells.append({"type": c["type"], "where": where(c), "conns": conns,
+        cells.append({"type": c["type"], "where": where(c), "lines": src_lines(c), "conns": conns,
+                      "memid": c.get("parameters", {}).get("MEMID"),
                       "ins": ins, "outs": outs, "is_register": c["type"] in REGISTER_TYPES})
+
+    # Memories are the one thing not joined by wires. Yosys emits a separate write cell and read
+    # cells that find each other through a MEMID parameter, so a plain walk stops dead at the
+    # register file. Give each memory one invented wire (negative, so it cannot clash with a real
+    # bit number) that the write drives and the reads depend on.
+    invented = {}
+    for c in cells:
+        if not c["memid"]:
+            continue
+        b = invented.setdefault(c["memid"], -len(invented) - 1)
+        if c["type"].startswith("$memwr"):
+            c["outs"].add(b)
+        elif c["type"].startswith("$memrd"):
+            c["ins"].add(b)
 
     writers, readers = {}, {}
     for i, c in enumerate(cells):
@@ -69,10 +99,11 @@ def load(path):
         for b in c["ins"]:
             readers.setdefault(b, []).append(i)
 
-    outputs = {p: [b for b in info["bits"] if isinstance(b, int)]
-               for p, info in top["ports"].items() if info["direction"] == "output"}
+    def ports(direction):
+        return {p: [b for b in info["bits"] if isinstance(b, int)]
+                for p, info in top["ports"].items() if info["direction"] == direction}
     return {"top": top_name, "signals": signals, "names_of": names_of, "cells": cells,
-            "writers": writers, "readers": readers, "outputs": outputs}
+            "writers": writers, "readers": readers, "outputs": ports("output"), "inputs": ports("input")}
 
 
 def find(d, wanted):
@@ -200,6 +231,127 @@ def diff(before, after):
         print("  + " + n)
 
 
+def dot(d, name, hops=1):
+    """Print a graphviz graph of the cells around one signal. Render with:
+       python3 depgraph.py picorv32.json dot cpu_state > g.dot && dot -Tpng g.dot -o g.png
+    """
+    sig = d["signals"][name]
+    bits = set(sig["bits"])
+    cells = set()
+    for b in bits:
+        cells.update(d["writers"].get(b, []))
+        cells.update(d["readers"].get(b, []))
+    for _ in range(hops - 1):
+        for i in list(cells):
+            for b in d["cells"][i]["ins"] | d["cells"][i]["outs"]:
+                cells.update(d["writers"].get(b, []))
+    short = name.split(".")[-1]
+    print("digraph g {")
+    print('  rankdir=LR; node [shape=box, fontname="Helvetica", fontsize=10];')
+    print('  "%s" [shape=ellipse, style=filled, fillcolor=lightgrey];' % short)
+    for i in sorted(cells):
+        c = d["cells"][i]
+        label = "%s\\n%s" % (c["type"].lstrip("$"), c["where"])
+        print('  c%d [label="%s"%s];' % (i, label, ', style=filled, fillcolor=lightblue' if c["is_register"] else ""))
+        if bits & c["outs"]:
+            print('  c%d -> "%s";' % (i, short))
+        if bits & c["ins"]:
+            print('  "%s" -> c%d;' % (short, i))
+    print("}")
+
+
+def bits_from_lines(d, lines):
+    """The wires written by anything that came from the given source lines."""
+    start = set()
+    for c in d["cells"]:
+        if c["lines"] & lines:
+            start.update(c["outs"])
+    for sig in d["signals"].values():
+        if sig["lines"] & lines:
+            start.update(sig["bits"])
+    return start
+
+
+def read_vcd(path):
+    """Read a VCD waveform file into {signal name: [(time, value), ...]}.
+
+    A VCD is a header that maps short id codes to signal names, then a list of
+    timestamps and the value changes that happened at each one.
+    """
+    codes, scope, traces, t, in_header = {}, [], {}, 0, True
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        if in_header:
+            if line.startswith("$scope"):
+                scope.append(line.split()[2])
+            elif line.startswith("$upscope"):
+                scope and scope.pop()
+            elif line.startswith("$var"):
+                bits = line.split()
+                codes.setdefault(bits[3], []).append(".".join(scope + [bits[4]]))
+            elif line.startswith("$enddefinitions"):
+                in_header = False
+            continue
+        if line.startswith("#"):
+            t = int(line[1:])
+        elif line[0] in "bB":
+            value, _, code = line[1:].partition(" ")
+            for n in codes.get(code.strip(), []):
+                traces.setdefault(n, []).append((t, value))
+        elif line[0] not in "rR$":
+            for n in codes.get(line[1:], []):
+                traces.setdefault(n, []).append((t, line[0]))
+    return traces
+
+
+def verify(d, before_vcd, after_vcd, lines, prefix="testbench.uut."):
+    """Check the graph's prediction against two real simulation runs.
+
+    Give it the lines that changed between the runs. The graph predicts which signals
+    that change can reach. The waveforms say which signals actually changed. Any signal
+    that changed but was not predicted means the graph is wrong.
+    """
+    start = bits_from_lines(d, lines)
+    bits, cells, _ = reach(d, start, stop_at_registers=False)
+    predicted = {n.split(".")[-1] for b in bits for n in d["names_of"].get(b, [])}
+
+    before, after = read_vcd(before_vcd), read_vcd(after_vcd)
+    shared = set(before) & set(after)
+    changed = {n for n in shared if before[n] != after[n]}
+    # keep only signals inside the design that the graph also knows about
+    known = set(d["signals"]) | {n.split(".")[-1] for n in d["signals"]}
+    def short(n):
+        return n[len(prefix):].split(".")[-1] if n.startswith(prefix) else None
+    changed_in_design = {short(n) for n in changed if short(n) and short(n) in known}
+    missed = changed_in_design - predicted
+    # A wire driven by an input comes from the testbench, not from the design, so no graph of the
+    # design alone can predict it: the bug changed what the core asked for and the testbench answered
+    # differently. Match on wires, not names, because designs alias inputs (dbg_mem_ready = mem_ready).
+    input_bits = {b for bits in d["inputs"].values() for b in bits}
+    from_outside = sorted(n for n in missed
+                          if any(set(d["signals"][full]["bits"]) <= input_bits
+                                 for full in d["signals"] if full.split(".")[-1] == n))
+    inside = sorted(missed - set(from_outside))
+
+    print("seeded from %d changed line(s): %d wires" % (len(lines), len(start)))
+    print("graph predicts %d signals can be affected" % len(predicted))
+    print("waveforms: %d signals dumped, %d changed, %d of those are design signals the graph knows"
+          % (len(shared), len(changed), len(changed_in_design)))
+    print("changed but not predicted: %d" % len(missed))
+    for n in inside[:15]:
+        print("  %s  (inside the design, the graph is wrong)" % n)
+    if len(inside) > 15:
+        print("  ... and %d more inside the design" % (len(inside) - 15))
+    for n in from_outside:
+        print("  %s  (an input, driven by the testbench, not by the design)" % n)
+    print()
+    print("SOUND: every signal the design itself drives was predicted." if not inside
+          else "UNSOUND: the graph missed %d signal(s) the design drives." % len(inside))
+    return len(inside)
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         sys.exit(__doc__)
@@ -214,5 +366,11 @@ if __name__ == "__main__":
         impact(d, find(d, sys.argv[3]), as_tapeout="--tapeout" in sys.argv)
     elif cmd == "diff":
         diff(d, load(sys.argv[3]))
+    elif cmd == "dot":
+        dot(d, find(d, sys.argv[3]))
+    elif cmd == "verify":
+        at = sys.argv.index("--line")
+        want = {int(x) for x in sys.argv[at + 1].split(",")}
+        verify(d, sys.argv[3], sys.argv[4], want)
     else:
         sys.exit("unknown command: " + cmd)
