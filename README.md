@@ -145,6 +145,15 @@ It says `confirmed` because every number in it was computed by walking the netli
 - `diff` compares by name only, for the reason in the section above.
 - No tests. It is a reading tool, and I checked its answers by hand against the source.
 
+## What's next
+
+Three things I want to get to, roughly in order:
+
+- Tie a coverage database to the graph, so "which tests touched this line" becomes a real edge instead
+  of something I imagine.
+- Work out what "the same signal" means across two revisions, since names clearly do not survive a rename.
+- Write real assertions. They look like the most useful thing in the language and mine are toys.
+
 ## Notes
 
 [NOTES.md](NOTES.md) is what I wrote down while reading PicoRV32, which is where all of this came from.
