@@ -79,28 +79,8 @@ picorv32_core.reg_pc (32 bits, declared at picorv32.v:176)
 Two numbers because there are two questions. Stop at the registers and you get what moves in this same
 clock tick. Walk through them and you get what can move eventually, over many ticks.
 
-## Three things that surprised me
 
-**On a CPU, almost everything reaches almost everything.** The program counter, the decoded immediate,
-and the state machine all reach 893 of 919 cells and the same 15 outputs. So "what does this touch,
-eventually" is close to useless as a way to decide what to re-test. The same-cycle number is the one
-that varies and means something.
 
-**The graph is of one configuration, not of the source.** PicoRV32 has parameters, and `ENABLE_IRQ`
-defaults to 0. So `irq_pending` reaches 6 cells and zero chip outputs: the interrupt logic was compiled
-out before I ever saw it. Change the parameter and the answer changes. A tool like this has to say
-which configuration it is talking about.
-
-**Names are not identity.** `diff` compares two versions of the design by signal name:
-
-```
-$ git -C picorv32 show 6d145b7^:picorv32.v > before.v && git -C picorv32 show 6d145b7:picorv32.v > after.v
-$ for f in before after; do yosys -q -p "read_verilog $f.v; hierarchy -top picorv32_axi; proc; flatten; opt_clean; write_json $f.json"; done
-$ python3 depgraph.py before.json diff after.json
-same name: 190   gone: 1   new: 1
-  - decoded_imm_uj
-  + decoded_imm_j
-```
 
 That is a real PicoRV32 commit (`6d145b7`) that renamed one signal and changed no logic at all. By name
 it looks like something was deleted and something else appeared. Everything I know about the old signal,
